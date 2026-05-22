@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ADOBE_DNG_URL="${ADOBE_DNG_URL:-https://www.adobe.com/go/dng_converter_win}"
+DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
+ADOBE_DNG_WINEPREFIX="${ADOBE_DNG_WINEPREFIX:-${ADC_WINEPREFIX:-$DATA_HOME/z9-nef-wine-fits/wineprefix}}"
+DOWNLOAD_DIR="${DOWNLOAD_DIR:-$HOME/Downloads/adobe-dng-converter}"
+INSTALLER="${ADOBE_DNG_INSTALLER:-$DOWNLOAD_DIR/AdobeDNGConverter_x64.exe}"
+WINE_BIN="${ADOBE_DNG_WINE:-${ADC_WINE_BIN:-}}"
+
+usage() {
+  cat >&2 <<'USAGE'
+Usage:
+  setup-adobe-dng-wine
+
+Environment overrides:
+  ADOBE_DNG_WINEPREFIX=/path/to/wineprefix
+  ADOBE_DNG_INSTALLER=/path/to/AdobeDNGConverter_x64.exe
+  ADOBE_DNG_URL=https://www.adobe.com/go/dng_converter_win
+  ADOBE_DNG_WINE=/path/to/wine
+USAGE
+  exit 1
+}
+
+case "${1:-}" in
+  -h|--help) usage ;;
+esac
+
+if [ -z "$WINE_BIN" ]; then
+  if command -v wine64 >/dev/null 2>&1; then
+    WINE_BIN="$(command -v wine64)"
+  elif command -v wine >/dev/null 2>&1; then
+    WINE_BIN="$(command -v wine)"
+  fi
+fi
+
+if [ -z "$WINE_BIN" ]; then
+  cat >&2 <<'MSG'
+[ERROR] Wine is not installed or not on PATH.
+
+Ubuntu setup:
+  sudo dpkg --add-architecture i386
+  sudo apt-get update
+  sudo apt-get install -y wine64 wine wine32:i386 xvfb curl
+MSG
+  exit 1
+fi
+
+mkdir -p "$DOWNLOAD_DIR" "$(dirname "$ADOBE_DNG_WINEPREFIX")"
+
+if [ ! -s "$INSTALLER" ]; then
+  echo "Downloading Adobe DNG Converter for Windows..."
+  if command -v curl >/dev/null 2>&1; then
+    curl -L "$ADOBE_DNG_URL" -o "$INSTALLER"
+  elif command -v wget >/dev/null 2>&1; then
+    wget -O "$INSTALLER" "$ADOBE_DNG_URL"
+  else
+    echo "[ERROR] Need curl or wget to download $ADOBE_DNG_URL" >&2
+    exit 1
+  fi
+else
+  echo "Using existing installer: $INSTALLER"
+fi
+
+echo "Wine prefix: $ADOBE_DNG_WINEPREFIX"
+echo "Running Adobe installer with: $WINE_BIN"
+
+if ! env WINEPREFIX="$ADOBE_DNG_WINEPREFIX" WINEARCH=win64 "$WINE_BIN" "$INSTALLER"; then
+  cat >&2 <<'MSG'
+[ERROR] Wine could not start the Adobe installer.
+
+If the error mentions kernel32.dll, wine32, or syswow64, install 32-bit Wine support:
+  sudo dpkg --add-architecture i386
+  sudo apt-get update
+  sudo apt-get install -y wine64 wine wine32:i386
+MSG
+  exit 1
+fi
+
+cat <<MSG
+
+If the installer completed, the converter should be under:
+  $ADOBE_DNG_WINEPREFIX/drive_c/Program Files/Adobe/Adobe DNG Converter/Adobe DNG Converter.exe
+
+The converter command auto-detects that default prefix. For a custom prefix, run conversions with:
+  ADOBE_DNG_WINEPREFIX="$ADOBE_DNG_WINEPREFIX" bin/z9-nef-to-fits '/path/to/*.NEF'
+MSG

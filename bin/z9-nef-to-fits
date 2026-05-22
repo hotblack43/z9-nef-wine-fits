@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat >&2 <<'USAGE'
+Usage:
+  z9-nef-to-fits PATH_OR_WILDCARD [FILE ...]
+
+Examples:
+  z9-nef-to-fits '/path/with spaces/orig'
+  z9-nef-to-fits '/path/with spaces/orig/iss074e0407*.NEF'
+  z9-nef-to-fits orig/iss*.NEF
+
+Writes FITS to: input_directory/FITS_LINEAR
+Intermediate DNGs are removed by default. Details go to z9-nef-to-fits.log in the output directory.
+USAGE
+  exit 1
+}
+
+[ $# -ge 1 ] || usage
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONVERTER="$SCRIPT_DIR/z9-nef-to-fits-one"
+[ -x "$CONVERTER" ] || { echo "[ERROR] Missing converter: $CONVERTER" >&2; exit 1; }
+
+collect_files() {
+  local arg="$1"
+  if [ -d "$arg" ]; then
+    find "$arg" -maxdepth 1 -type f -iname '*.nef' -print0
+  else
+    # Intentional wildcard expansion for the single PATH_OR_WILDCARD argument.
+    local matches=( $arg )
+    if [ ${#matches[@]} -eq 0 ]; then
+      return 0
+    fi
+    printf '%s\0' "${matches[@]}" | while IFS= read -r -d '' f; do
+      [ -f "$f" ] || continue
+      case "${f##*.}" in
+        NEF|nef|DNG|dng) printf '%s\0' "$f" ;;
+      esac
+    done
+  fi
+}
+
+TMP_LIST="$(mktemp -t z9simple.XXXXXX)"
+trap 'rm -f "$TMP_LIST"' EXIT
+for arg in "$@"; do
+  collect_files "$arg" >> "$TMP_LIST"
+done
+
+COUNT="$(python3 - "$TMP_LIST" <<'PY'
+import sys
+with open(sys.argv[1], 'rb') as f:
+    print(f.read().count(b'\0'))
+PY
+)"
+
+if [ "$COUNT" -eq 0 ]; then
+  echo "[ERROR] No NEF/DNG files matched." >&2
+  exit 1
+fi
+
+FIRST="$(python3 - "$TMP_LIST" <<'PY'
+import sys
+with open(sys.argv[1], 'rb') as f:
+    first = f.read().split(b'\0', 1)[0]
+print(first.decode())
+PY
+)"
+
+OUTDIR="$(dirname "$FIRST")/FITS_LINEAR"
+mkdir -p "$OUTDIR"
+
+LOG="$OUTDIR/z9-nef-to-fits.log"
+: > "$LOG"
+echo "Converting $COUNT file(s) to: $OUTDIR"
+
+idx=0
+while IFS= read -r -d '' raw; do
+  idx=$((idx + 1))
+  printf '[%s/%s] %s ... ' "$idx" "$COUNT" "$(basename "$raw")"
+  if "$CONVERTER" "$raw" --outdir "$OUTDIR" >>"$LOG" 2>&1; then
+    echo "ok"
+  else
+    echo "failed (see $LOG)"
+  fi
+done < "$TMP_LIST"
+
+echo "Done. FITS written to: $OUTDIR"
+echo "Log: $LOG"

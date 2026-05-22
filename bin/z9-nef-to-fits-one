@@ -1,0 +1,118 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat >&2 <<'USAGE'
+Usage:
+  z9-nef-to-fits-one INPUT [OUTPUT_DIR] [INPUT ...] [--outdir DIR] [--mode cfa|planes|rgb] [--greens mean|both] [--keep-dng]
+
+Purpose:
+  Convert Nikon Z9 `.NEF` files to linear FITS.
+  If a Z9 NEF cannot be read directly, the script falls back to Adobe DNG Converter,
+  then reads the generated `.dng` and writes FITS.
+
+Defaults:
+  --mode planes
+  --greens both
+  --outdir dirname(first input)/FITS_LINEAR
+
+Examples:
+  z9-nef-to-fits-one /path/to/file.NEF
+  z9-nef-to-fits-one /path/to/NEF_DIR /path/to/FITS_LINEAR
+  z9-nef-to-fits-one /path/to/*.NEF --outdir /path/to/FITS_LINEAR
+  z9-nef-to-fits-one /path/to/NEF_DIR --keep-dng
+
+Notes:
+  - This is the Z9 entry point.
+  - Do not use `D5NEF_to_linearFITS.sh` for Nikon Z9 files.
+  - Requires Adobe DNG Converter. On Linux, run bin/setup-adobe-dng-wine first.
+USAGE
+  exit 1
+}
+
+[ $# -ge 1 ] || usage
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONVERTER="$SCRIPT_DIR/z9-nef-to-fits-worker"
+
+[ -x "$CONVERTER" ] || {
+  echo "[ERROR] Missing converter: $CONVERTER" >&2
+  exit 1
+}
+
+MODE="planes"
+GREENS="both"
+OUTDIR=""
+KEEP_DNG=0
+POSITIONALS=()
+INPUTS=()
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --mode)
+      [ $# -lt 2 ] && usage
+      MODE="$2"; shift 2 ;;
+    --greens)
+      [ $# -lt 2 ] && usage
+      GREENS="$2"; shift 2 ;;
+    --outdir)
+      [ $# -lt 2 ] && usage
+      OUTDIR="$2"; shift 2 ;;
+    --keep-dng)
+      KEEP_DNG=1; shift ;;
+    --help|-h)
+      usage ;;
+    --*)
+      echo "[ERROR] Unknown option: $1" >&2
+      usage ;;
+    *)
+      POSITIONALS+=("$1"); shift ;;
+  esac
+done
+
+[ ${#POSITIONALS[@]} -gt 0 ] || usage
+
+case "$MODE" in
+  cfa|planes|rgb) ;;
+  *) echo "[ERROR] --mode must be cfa|planes|rgb" >&2; exit 1 ;;
+esac
+
+case "$GREENS" in
+  mean|both) ;;
+  *) echo "[ERROR] --greens must be mean|both" >&2; exit 1 ;;
+esac
+
+is_raw_like_path() {
+  case "${1##*.}" in
+    NEF|nef|DNG|dng|FITS|fits|FIT|fit) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+INPUTS=( "${POSITIONALS[@]}" )
+if [ -z "$OUTDIR" ] && [ ${#POSITIONALS[@]} -ge 2 ]; then
+  second="${POSITIONALS[1]}"
+  if [[ "$second" == */FITS_LINEAR || "$second" == "FITS_LINEAR" ]] || ! is_raw_like_path "$second"; then
+    OUTDIR="$second"
+    INPUTS=( "${POSITIONALS[0]}" )
+    if [ ${#POSITIONALS[@]} -gt 2 ]; then
+      INPUTS+=( "${POSITIONALS[@]:2}" )
+    fi
+  fi
+fi
+
+if [ -z "$OUTDIR" ]; then
+  first_input="${INPUTS[0]}"
+  if [ -d "$first_input" ]; then
+    OUTDIR="$first_input/FITS_LINEAR"
+  else
+    OUTDIR="$(dirname "$first_input")/FITS_LINEAR"
+  fi
+fi
+
+CMD=( "$CONVERTER" "${INPUTS[@]}" "$OUTDIR" --mode "$MODE" --greens "$GREENS" )
+if [ "$KEEP_DNG" -eq 1 ]; then
+  CMD+=( --keep-dng )
+fi
+
+QUIET=1 "${CMD[@]}"

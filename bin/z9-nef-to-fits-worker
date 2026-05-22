@@ -1,0 +1,801 @@
+#!/usr/bin/env bash
+# --- DNG retention flag (default: remove) ------------------------------
+# Use --keep-dng to *keep* DNG intermediates; otherwise we delete them at the end.
+KEEP_DNG=0
+# Pre-scan argv to catch and strip --keep-dng without touching the main parser
+_NEW_ARGS=()
+for _arg in "$@"; do
+  case "$_arg" in
+    --keep-dng) KEEP_DNG=1 ;;
+    *) _NEW_ARGS+=("$_arg") ;;
+  esac
+done
+set -- "${_NEW_ARGS[@]}"
+# ----------------------------------------------------------------------
+
+# --- DNG cleanup via trap on EXIT (runs on success or most errors) -----------
+# Capture the *initial* input root (first positional argument as invoked)
+INPUT_ROOT_AT_START="${1:-}"
+__cleanup_dngs() {
+  # Only remove if not requested to keep
+  if [ "${KEEP_DNG:-0}" -ne 0 ]; then
+    return 0
+  fi
+  # Need a valid directory to search
+  if [ -z "$INPUT_ROOT_AT_START" ] || [ ! -d "$INPUT_ROOT_AT_START" ]; then
+    return 0
+  fi
+    # Find each _DNG_BY_SCRIPT directory and delete only .dng files inside
+  # Robust to lack of -delete; fall back to rm -f
+  while IFS= read -r -d '' _d; do
+    if command -v find >/dev/null 2>&1; then
+      find "$_d" -maxdepth 1 -type f \( -iname '*.dng' \) -delete 2>/dev/null \
+      || { find "$_d" -maxdepth 1 -type f \( -iname '*.dng' \) -exec rm -f -- {} +; }
+    else
+      for _f in "$_d"/*.dng "$_d"/*.DNG; do
+        [ -f "$_f" ] && rm -f -- "$_f"
+      done
+    fi
+  done < <(find "$INPUT_ROOT_AT_START" -type d -name "_DNG_BY_SCRIPT" -print0 2>/dev/null)
+}
+# Register the trap once
+trap '__cleanup_dngs' EXIT
+# -----------------------------------------------------------------------------
+
+
+
+set -euo pipefail
+QUIET="${QUIET:-0}"
+qinfo() { [ "$QUIET" -eq 1 ] || echo "$@"; }
+qwarn() { [ "$QUIET" -eq 1 ] || echo "$@"; }
+
+# ----------------------------------------------------------------------
+# z9-nef-to-fits-worker  (photometry-safe; writes EXIF to FITS)
+#
+# * Photometry-safe:
+#   - NO bias (black) subtraction
+#   - NO scaling / gamma / auto-brightening
+#   - Writes raw sensor counts or controlled linear transforms
+#
+# * Input policy:
+#   - Accepts existing .NEF and .DNG files.
+#   - For unsupported .NEF (for example Z9 HE/HE*), runs Adobe DNG Converter
+#     to create a fresh, lossless, non-linearized DNG and converts that.
+#
+# * Modes:
+#     --mode cfa    : single-plane raw CFA counts
+#     --mode planes : per-channel planes by 2x2 averaging (downsample x2)
+#     --mode rgb    : linear demosaic (simple linear interpolation) -> FITS cube (3,H,W)
+#   Greens in 'planes':
+#     --greens mean or --greens both (default; G1/G2 separately)
+#
+# * FITS headers (when exiftool is available):
+#     DATE-OBS   From EXIF DateTimeOriginal
+#     ORIGFILE   Original raw filename
+#     EXPTIME    Exposure time [s]
+#     ISO        ISO setting
+#     FNUMBER    F-number
+#     FOCALLEN   Focal length [mm]
+#     INSTRUME   Camera make + model
+#
+# Usage:
+#   z9-nef-to-fits-worker INPUT_DIR [OUTPUT_DIR] [--mode cfa|rgb|planes] [--greens mean|both]
+# ----------------------------------------------------------------------
+
+usage() {
+  cat >&2 <<'USAGE'
+Usage:
+  z9-nef-to-fits-worker INPUT_PATH [OUTPUT_DIR] [--mode cfa|rgb|planes] [--greens mean|both] [--keep-dng]
+
+Defaults:
+  OUTPUT_DIR = derived from INPUT_PATH
+               directory input  -> INPUT_PATH/FITS_LINEAR
+               file input       -> dirname(INPUT_PATH)/FITS_LINEAR
+  --mode     = planes
+  --greens   = both   (only used with --mode planes)
+
+Examples:
+  z9-nef-to-fits-worker /path/to/RAW_DIR
+  z9-nef-to-fits-worker /path/to/DNG_DIR --mode planes --greens both
+  z9-nef-to-fits-worker /path/to/file1.dng /path/to/file2.dng --mode rgb
+
+Notes:
+  - No input path is hardwired. You must provide at least one input path.
+  - Accepted inputs: .nef, .dng, directories, or shell-expanded file lists.
+USAGE
+  exit 1
+}
+
+# ---- Parse args (POSIX-friendly, bash 3.2 compatible) ----
+[ $# -lt 1 ] && {
+  echo "[ERROR] Missing input path." >&2
+  usage
+}
+IN_DIR="$1"; shift || true
+# Detect if user passed a *list of files* (e.g., unquoted glob expanded by the shell)
+MULTI_FILES=0
+FILE_ARGS=()
+is_raw_like_arg() {
+  case "${1##*.}" in
+    NEF|nef|DNG|dng|FITS|fits|FIT|fit) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+if [ -f "$IN_DIR" ]; then
+  while [ $# -gt 0 ] && [ "${1#--}" = "$1" ] && [ -f "$1" ] && is_raw_like_arg "$1"; do
+    FILE_ARGS+=("$1")
+    shift
+  done
+  if [ ${#FILE_ARGS[@]} -gt 0 ]; then
+    MULTI_FILES=1
+  fi
+fi
+
+# Basic validation for the first input token. Allow wildcards to pass through
+# to the later expansion logic, but reject obviously nonexistent concrete paths.
+case "$IN_DIR" in
+  *'*'*|*'?'*|*'['*']'* ) : ;;
+  *)
+    if [ ! -e "$IN_DIR" ]; then
+      echo "[ERROR] Input path does not exist: $IN_DIR" >&2
+      usage
+    fi
+    ;;
+esac
+
+OUT_DIR=""
+MODE="planes"
+GREENS="both"
+
+# If next arg doesn’t start with --, treat as OUT_DIR
+if [ $MULTI_FILES -eq 0 ] && [ $# -gt 0 ] && [ "${1#--}" = "$1" ]; then
+  OUT_DIR="$1"; shift
+fi
+if [ -z "$OUT_DIR" ]; then
+  if [ $MULTI_FILES -eq 1 ] || [ -f "$IN_DIR" ]; then OUT_DIR="$(dirname "$IN_DIR")/FITS_LINEAR"; else OUT_DIR="$IN_DIR/FITS_LINEAR"; fi
+fi
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --mode)
+      [ $# -lt 2 ] && usage
+      MODE="$2"; shift 2;;
+    --greens)
+      [ $# -lt 2 ] && usage
+      GREENS="$2"; shift 2;;
+    --help|-h) usage;;
+    *) echo "Unknown option: $1" >&2; usage;;
+  esac
+done
+
+case "$MODE" in
+  cfa|rgb|planes) : ;;
+  *) echo "[ERROR] --mode must be cfa|rgb|planes" >&2; exit 1;;
+esac
+case "$GREENS" in
+  mean|both) : ;;
+  *) echo "[ERROR] --greens must be mean|both" >&2; exit 1;;
+esac
+
+mkdir -p "$OUT_DIR"
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# ---- Adobe DNG Converter path/command ----
+# On Linux, install the Windows Adobe DNG Converter under Wine with
+# bin/setup-adobe-dng-wine. Environment overrides are supported for packaging
+# and non-default installs.
+ADC_MAC_BIN_DEFAULT="/Applications/Adobe DNG Converter.app/Contents/MacOS/Adobe DNG Converter"
+ADC_WINE_BIN="${ADOBE_DNG_WINE:-${ADC_WINE_BIN:-}}"
+ADC_WINEPREFIX="${ADOBE_DNG_WINEPREFIX:-${ADC_WINEPREFIX:-${WINEPREFIX:-$HOME/.local/share/z9-nef-wine-fits/wineprefix}}}"
+ADC_WIN_EXE="${ADOBE_DNG_EXE:-${ADC_WIN_EXE:-}}"
+ADC_BIN="${ADC_BIN:-}"
+ADC_CMD=()
+HAS_ADC=0
+
+find_wine_bin() {
+  if [ -n "$ADC_WINE_BIN" ]; then
+    printf '%s\n' "$ADC_WINE_BIN"
+  elif command -v wine64 >/dev/null 2>&1; then
+    command -v wine64
+  elif command -v wine >/dev/null 2>&1; then
+    command -v wine
+  fi
+}
+
+try_adc_native() {
+  local candidate="$1"
+  if [ -n "$candidate" ] && [ -x "$candidate" ]; then
+    ADC_CMD=("$candidate")
+    HAS_ADC=1
+  fi
+}
+
+try_adc_wine() {
+  local candidate="$1" wine_bin
+  [ -n "$candidate" ] && [ -f "$candidate" ] || return 0
+  wine_bin="$(find_wine_bin || true)"
+  [ -n "$wine_bin" ] || return 0
+  if command -v xvfb-run >/dev/null 2>&1; then
+    ADC_CMD=(xvfb-run -a env WINEPREFIX="$ADC_WINEPREFIX" LIBGL_ALWAYS_SOFTWARE=1 WINEDEBUG=-all "$wine_bin" "$candidate")
+  else
+    ADC_CMD=(env WINEPREFIX="$ADC_WINEPREFIX" LIBGL_ALWAYS_SOFTWARE=1 WINEDEBUG=-all "$wine_bin" "$candidate")
+  fi
+  HAS_ADC=1
+}
+
+try_adc_native "$ADC_BIN"
+if [ "$HAS_ADC" -ne 1 ]; then try_adc_native "$ADC_MAC_BIN_DEFAULT"; fi
+if [ "$HAS_ADC" -ne 1 ]; then try_adc_wine "$ADC_WIN_EXE"; fi
+if [ "$HAS_ADC" -ne 1 ]; then
+  try_adc_wine "$ADC_WINEPREFIX/drive_c/Program Files/Adobe/Adobe DNG Converter/Adobe DNG Converter.exe"
+fi
+if [ "$HAS_ADC" -ne 1 ]; then
+  try_adc_wine "$ADC_WINEPREFIX/drive_c/Program Files (x86)/Adobe/Adobe DNG Converter/Adobe DNG Converter.exe"
+fi
+if [ "$HAS_ADC" -ne 1 ]; then
+  try_adc_wine "$HOME/.wine/drive_c/Program Files/Adobe/Adobe DNG Converter/Adobe DNG Converter.exe"
+fi
+if [ "$HAS_ADC" -ne 1 ]; then
+  try_adc_wine "$HOME/.wine/drive_c/Program Files (x86)/Adobe/Adobe DNG Converter/Adobe DNG Converter.exe"
+fi
+
+if [ "$HAS_ADC" -eq 1 ]; then
+  qinfo "[INFO] Adobe DNG Converter command: ${ADC_CMD[*]}"
+else
+  qwarn "[WARN] Adobe DNG Converter not available."
+  qwarn "       Checked native macOS path and common Wine install paths."
+  qwarn "       Run bin/setup-adobe-dng-wine, or set ADOBE_DNG_WINEPREFIX and ADOBE_DNG_EXE."
+  qwarn "       Existing DNG inputs will still work, but unsupported NEF fallback is disabled."
+fi
+ADC_OUT_SUBDIR_NAME="_DNG_BY_SCRIPT"
+
+# ---- Tools check ----
+if ! command -v exiftool >/dev/null 2>&1; then
+  qwarn "[WARN] exiftool not found in PATH; FITS headers will miss exposure metadata."
+  HAS_EXIFTOOL=0
+else
+  HAS_EXIFTOOL=1
+  qinfo "[INFO] exiftool found; exposure metadata will be written."
+fi
+
+# ---- Python runner (prefer uv project env; fallback to local venv) ----
+PYTHON_RUNNER=()
+
+if command -v uv >/dev/null 2>&1; then
+  qinfo "[INFO] Using uv project environment for Python."
+  PYTHON_RUNNER=(uv run --project "$SCRIPT_DIR" python)
+else
+  VENV_DIR="$SCRIPT_DIR/.nef2fits_env"
+  recreate_venv=0
+  if [ ! -d "$VENV_DIR" ]; then
+    recreate_venv=1
+  elif [ ! -x "$VENV_DIR/bin/python" ] && [ ! -x "$VENV_DIR/bin/python3" ]; then
+    recreate_venv=1
+  fi
+
+  if [ "$recreate_venv" -eq 1 ]; then
+    qinfo "[INFO] Creating Python venv at $VENV_DIR"
+    rm -rf "$VENV_DIR"
+    python3 -m venv "$VENV_DIR"
+  fi
+
+  if [ -x "$VENV_DIR/bin/python" ]; then
+    PYTHON_RUNNER=("$VENV_DIR/bin/python")
+  elif [ -x "$VENV_DIR/bin/python3" ]; then
+    PYTHON_RUNNER=("$VENV_DIR/bin/python3")
+  else
+    PYTHON_RUNNER=("$(command -v python3)")
+  fi
+fi
+
+run_python() {
+  "${PYTHON_RUNNER[@]}" "$@"
+}
+
+run_python - <<'PY'
+import importlib, sys
+missing = []
+for m in ("rawpy", "astropy", "numpy"):
+    try:
+        importlib.import_module(m)
+    except Exception:
+        missing.append(m)
+if missing:
+    raise SystemExit(
+        "Missing Python packages: "
+        + ", ".join(missing)
+        + ". If using uv, run 'uv sync'."
+    )
+import os
+if os.environ.get("QUIET") != "1":
+    print("[INFO] Python ready:", sys.executable)
+PY
+
+# ---- Build file list (supports directory OR wildcard path) ----
+FILES0="$(mktemp -t nef_list.XXXXXX)"
+IS_GLOB=0
+case "$IN_DIR" in
+  *'*'*|*'?'*|*'['*']'* ) IS_GLOB=1;;
+  *) IS_GLOB=0;;
+esac
+
+if [ $MULTI_FILES -eq 1 ]; then
+  # Explicit list of files (e.g., unquoted glob expanded by shell)
+  for f in "$IN_DIR" "${FILE_ARGS[@]}"; do
+    case "${f##*.}" in
+      [Nn][Ee][Ff]|[Dd][Nn][Gg]) [ -f "$f" ] && printf "%s\0" "$f" >> "$FILES0" ;;
+    esac
+  done
+  SRC_DESC="explicit files: ${#FILE_ARGS[@]}+1 item(s)"
+elif [ -f "$IN_DIR" ]; then
+  case "${IN_DIR##*.}" in
+    [Nn][Ee][Ff]|[Dd][Nn][Gg]) printf "%s\0" "$IN_DIR" >> "$FILES0" ;;
+  esac
+  SRC_DESC="file: $IN_DIR"
+elif [ "$IS_GLOB" -eq 1 ]; then
+  # Wildcard mode: expand the pattern safely and list only raw files we can consume directly
+  shopt -s nullglob nocaseglob
+  _matches=( $IN_DIR )
+  shopt -u nullglob nocaseglob
+  if [ ${#_matches[@]} -gt 0 ]; then
+    for f in "${_matches[@]}"; do
+      case "${f##*.}" in
+        [Nn][Ee][Ff]|[Dd][Nn][Gg]) [ -f "$f" ] && printf "%s\0" "$f" >> "$FILES0" ;;
+      esac
+    done
+  fi
+  SRC_DESC="pattern: $IN_DIR"
+else
+  # Directory mode (original behaviour)
+  find "$IN_DIR" -type f \( -iname '*.nef' -o -iname '*.dng' \) -print0 > "$FILES0"
+  SRC_DESC="directory: $IN_DIR"
+fi
+
+# ---- Count raw files from prepared list ----
+COUNT=$(python3 - "$FILES0" <<'PYCOUNT'
+import sys
+with open(sys.argv[1], 'rb') as f:
+    print(f.read().count(b'\0'))
+PYCOUNT
+)
+if [ "$COUNT" -eq 0 ]; then
+  echo "[WARN] No NEF/DNG files found ($SRC_DESC)"
+  rm -f "$FILES0"
+  exit 0
+fi
+qinfo "[INFO] Mode: $MODE   Greens: $GREENS"
+qinfo "[INFO] Converting $COUNT raw file(s) → FITS in: $OUT_DIR"
+
+# =========================
+# Python helper functions
+# =========================
+
+# Raw CFA (exact counts; NO bias subtraction; NO scaling)
+read_raw_cfa_py () {
+  # args: RAW_PATH OUT_NPZ
+  run_python - "$1" "$2" <<'PYCODE'
+import sys, numpy as np
+from pathlib import Path
+import rawpy
+
+raw_path = Path(sys.argv[1])
+npz_out  = Path(sys.argv[2])
+
+with rawpy.imread(str(raw_path)) as raw:
+    # EXACT sensor counts from the visible raw mosaic (no demosaic, bias retained)
+    arr = raw.raw_image_visible.astype(np.uint16)
+    np.savez(str(npz_out), data=arr, cfa_pattern=getattr(raw, "raw_pattern", None))
+PYCODE
+}
+
+# Demosaic to linear RGB (simple linear interpolation). Avoid for strict photometry.
+demosaic_linear_rgb_py () {
+  # args: RAW_PATH OUT_NPY
+  run_python - "$1" "$2" <<'PYCODE'
+import sys, numpy as np
+from pathlib import Path
+import rawpy
+
+raw_path = Path(sys.argv[1])
+npy_out  = Path(sys.argv[2])
+
+with rawpy.imread(str(raw_path)) as raw:
+    rgb = raw.postprocess(
+        gamma=(1,1),
+        no_auto_bright=True,
+        output_bps=16,
+        use_camera_wb=False,
+        user_wb=[1,1,1,1],
+        output_color=rawpy.ColorSpace.raw,
+        demosaic_algorithm=rawpy.DemosaicAlgorithm.LINEAR
+    )
+    np.save(str(npy_out), rgb.astype(np.uint16))
+PYCODE
+}
+
+# Extract per-channel planes (downsampled x2) from raw CFA by 2x2 averaging
+cfa_to_planes_py () {
+  # args: NPZ_IN OUT_NPZ GREENS
+  run_python - "$1" "$2" "$3" <<'PYCODE'
+import sys
+import numpy as np
+from pathlib import Path
+
+npz_in  = Path(sys.argv[1])
+npz_out = Path(sys.argv[2])
+greens_mode = sys.argv[3]  # "mean" or "both"
+
+z = np.load(str(npz_in), allow_pickle=True)
+arr = z['data'].astype(np.uint16)
+
+# NOTE: We must NOT average zeros. Each color occupies 1 pixel in each 2x2 Bayer cell.
+# Downsample by selecting the color locations directly. This preserves linear counts.
+R_plane = arr[0::2, 0::2]
+B_plane = arr[1::2, 1::2]
+G1      = arr[0::2, 1::2]
+G2      = arr[1::2, 0::2]
+
+if greens_mode == "both":
+    # Keep the two green planes separate (no averaging)
+    np.savez(str(npz_out), R=R_plane, G1=G1, G2=G2, B=B_plane)
+else:
+    # Mean the two green planes with integer rounding (still linear)
+    G_plane = ((G1.astype(np.uint32) + G2.astype(np.uint32) + 1) // 2).astype(np.uint16)
+    np.savez(str(npz_out), R=R_plane, G=G_plane, B=B_plane)
+PYCODE
+}
+
+old_bad_cfa_to_planes_py () {
+  # args: NPZ_IN OUT_NPZ GREENS
+  run_python - "$1" "$2" "$3" <<'PYCODE'
+import sys, numpy as np
+from pathlib import Path
+
+npz_in  = Path(sys.argv[1])
+npz_out = Path(sys.argv[2])
+greens_mode = sys.argv[3]  # "mean" or "both"
+
+z = np.load(str(npz_in), allow_pickle=True)
+arr = z['data'].astype(np.uint16)
+
+def block_mean(x):
+    h = (x.shape[0]//2)*2
+    w = (x.shape[1]//2)*2
+    x = x[:h,:w].reshape(h//2,2,w//2,2).mean(axis=(1,3))
+    return x.astype(np.uint16)
+
+R = np.zeros_like(arr, dtype=np.uint16)
+G = np.zeros_like(arr, dtype=np.uint16)
+B = np.zeros_like(arr, dtype=np.uint16)
+R[0::2,0::2] = arr[0::2,0::2]
+B[1::2,1::2] = arr[1::2,1::2]
+G[0::2,1::2] = arr[0::2,1::2]
+G[1::2,0::2] = arr[1::2,0::2]
+
+R_plane = block_mean(R)
+B_plane = block_mean(B)
+
+if greens_mode == "both":
+    G1 = np.zeros_like(arr, dtype=np.uint16)
+    G2 = np.zeros_like(arr, dtype=np.uint16)
+    G1[0::2,1::2] = arr[0::2,1::2]
+    G2[1::2,0::2] = arr[1::2,0::2]
+    def bmean_off(x,r0,c0):
+        h = (x.shape[0]-r0)//2*2
+        w = (x.shape[1]-c0)//2*2
+        x = x[r0:r0+h, c0:c0+w]
+        return x.reshape(x.shape[0]//2,2,x.shape[1]//2,2).mean(axis=(1,3)).astype(np.uint16)
+    G1_plane = bmean_off(G1,0,1)
+    G2_plane = bmean_off(G2,1,0)
+    np.savez(str(npz_out), R=R_plane, G1=G1_plane, G2=G2_plane, B=B_plane)
+else:
+    G_plane = block_mean(G)
+    np.savez(str(npz_out), R=R_plane, G=G_plane, B=B_plane)
+PYCODE
+}
+
+# =========================
+# FITS writers (read EXIF JSON path for metadata)
+# =========================
+
+# CFA writer (single plane)
+write_fits_cfa_py () {
+  # args: NPZ_IN FITS_OUT DATEOBS ORIG_NAME EXIF_JSON_PATH
+  run_python - "$1" "$2" "$3" "$4" "$5" <<'PYCODE'
+import sys, os, json, numpy as np
+from astropy.io import fits
+npz_in, fits_out, date_obs, orig, exif_path = sys.argv[1:6]
+z = np.load(npz_in)
+data = z['data'].astype(np.uint16)
+
+hdr = fits.Header()
+hdr['BITPIX']=16; hdr['BSCALE']=1; hdr['BZERO']=32768  # standard unsigned-16 representation
+hdr['COMMENT']="Raw CFA counts (ADU). No bias subtraction. No scaling. Linear."
+if date_obs: hdr['DATE-OBS']=(date_obs,'From EXIF DateTimeOriginal')
+hdr['ORIGFILE']=(orig,'Original raw filename')
+
+if exif_path and exif_path != "NONE" and os.path.exists(exif_path):
+    try:
+        meta_all = json.load(open(exif_path,'r'))
+        meta = meta_all[0] if isinstance(meta_all,list) and meta_all else meta_all
+        if 'ExposureTime' in meta: hdr['EXPTIME']=(float(meta['ExposureTime']),'Exposure time [s]')
+        if 'ISO' in meta: hdr['ISO']=(int(meta['ISO']),'ISO setting')
+        if 'FNumber' in meta: hdr['FNUMBER']=(float(meta['FNumber']),'F-number')
+        if 'FocalLength' in meta: hdr['FOCALLEN']=(float(meta['FocalLength']),'Focal length [mm]')
+        cam = (meta.get('Make','')+' '+meta.get('Model','')).strip()
+        if cam: hdr['INSTRUME']=(cam,'Camera model')
+    except Exception:
+        pass
+
+fits.PrimaryHDU(data=data, header=hdr).writeto(fits_out, overwrite=True)
+PYCODE
+}
+
+# RGB writer (cube with planes first: 3,H,W)
+write_fits_rgb_py () {
+  # args: NPY_RGB FITS_OUT DATEOBS ORIG_NAME EXIF_JSON_PATH
+  run_python - "$1" "$2" "$3" "$4" "$5" <<'PYCODE'
+import sys, os, json, numpy as np
+from astropy.io import fits
+npy_in, fits_out, date_obs, orig, exif_path = sys.argv[1:6]
+rgb = np.load(npy_in).astype(np.uint16)         # (H,W,3)
+cube = np.moveaxis(rgb, -1, 0)                  # (3,H,W)
+
+hdr = fits.Header()
+hdr['BITPIX']=16; hdr['BSCALE']=1; hdr['BZERO']=32768
+hdr['COMMENT']="Linear demosaiced RGB (linear interp). No gamma, no auto-bright."
+hdr['NPLANE']=(3,'RGB planes: 1=R, 2=G, 3=B')
+if date_obs: hdr['DATE-OBS']=(date_obs,'From EXIF DateTimeOriginal')
+hdr['ORIGFILE']=(orig,'Original raw filename')
+
+if exif_path and exif_path != "NONE" and os.path.exists(exif_path):
+    try:
+        meta_all = json.load(open(exif_path,'r'))
+        meta = meta_all[0] if isinstance(meta_all,list) and meta_all else meta_all
+        if 'ExposureTime' in meta: hdr['EXPTIME']=(float(meta['ExposureTime']),'Exposure time [s]')
+        if 'ISO' in meta: hdr['ISO']=(int(meta['ISO']),'ISO setting')
+        if 'FNumber' in meta: hdr['FNUMBER']=(float(meta['FNumber']),'F-number')
+        if 'FocalLength' in meta: hdr['FOCALLEN']=(float(meta['FocalLength']),'Focal length [mm]')
+        cam = (meta.get('Make','')+' '+meta.get('Model','')).strip()
+        if cam: hdr['INSTRUME']=(cam,'Camera model')
+    except Exception:
+        pass
+
+fits.PrimaryHDU(data=cube, header=hdr).writeto(fits_out, overwrite=True)
+PYCODE
+}
+
+# PLANES writer (multi-extension FITS)
+write_fits_planes_cube_py () {
+  # args: NPZ_PLANES FITS_OUT DATEOBS ORIG_NAME EXIF_JSON_PATH
+  run_python - "$1" "$2" "$3" "$4" "$5" <<'PYCODE'
+import sys, os, json, numpy as np
+from astropy.io import fits
+npz_in, fits_out, date_obs, orig, exif_path = sys.argv[1:6]
+z = np.load(npz_in)
+keys = list(z.keys())
+order = ['R','G','G1','G2','B']
+ordered = [k for k in order if k in keys]
+hdus=[]
+for i,k in enumerate(ordered):
+    data = z[k].astype(np.uint16)
+    if i==0:
+        hdr = fits.Header(); hdr['BITPIX']=16; hdr['BSCALE']=1; hdr['BZERO']=32768
+        hdr['COMMENT']="Per-channel planes from CFA (2x2 avg, downsample x2). Linear."
+        if date_obs: hdr['DATE-OBS']=(date_obs,'From EXIF DateTimeOriginal')
+        hdr['ORIGFILE']=(orig,'Original raw filename')
+        if exif_path and exif_path != "NONE" and os.path.exists(exif_path):
+            try:
+                meta_all = json.load(open(exif_path,'r'))
+                meta = meta_all[0] if isinstance(meta_all,list) and meta_all else meta_all
+                if 'ExposureTime' in meta: hdr['EXPTIME']=(float(meta['ExposureTime']),'Exposure time [s]')
+                if 'ISO' in meta: hdr['ISO']=(int(meta['ISO']),'ISO setting')
+                if 'FNumber' in meta: hdr['FNUMBER']=(float(meta['FNumber']),'F-number')
+                if 'FocalLength' in meta: hdr['FOCALLEN']=(float(meta['FocalLength']),'Focal length [mm]')
+                cam = (meta.get('Make','')+' '+meta.get('Model','')).strip()
+                if cam: hdr['INSTRUME']=(cam,'Camera model')
+            except Exception:
+                pass
+        hdus.append(fits.PrimaryHDU(data=data, header=hdr))
+    else:
+        hdus.append(fits.ImageHDU(data=data, name=k))
+fits.HDUList(hdus).writeto(fits_out, overwrite=True)
+PYCODE
+}
+
+# PLANES->RGB CUBE writer (Primary HDU is a 3D cube)
+write_fits_planes_cube_py () {
+  # args: NPZ_PLANES FITS_OUT DATEOBS ORIG_NAME EXIF_JSON_PATH
+  run_python - "$1" "$2" "$3" "$4" "$5" <<'PYCODE'
+import sys, os, json, numpy as np
+from astropy.io import fits
+npz_in, fits_out, date_obs, orig, exif_path = sys.argv[1:6]
+z = np.load(npz_in, allow_pickle=True)
+
+# Prefer R,G,B; otherwise build G from G1,G2 if present
+if all(k in z for k in ('R','G','B')):
+    planes = [z['R'].astype(np.uint16), z['G'].astype(np.uint16), z['B'].astype(np.uint16)]
+elif all(k in z for k in ('R','G1','G2','B')):
+    G = ((z['G1'].astype(np.uint32) + z['G2'].astype(np.uint32) + 1)//2).astype(np.uint16)
+    planes = [z['R'].astype(np.uint16), G, z['B'].astype(np.uint16)]
+else:
+    raise SystemExit(f"Unexpected planes in NPZ: {list(z.keys())}")
+
+cube = np.stack(planes, axis=0)  # (3,H,W)
+
+hdr = fits.Header()
+hdr['BITPIX']=16; hdr['BSCALE']=1; hdr['BZERO']=32768
+hdr['COMMENT']="Per-channel planes from CFA (subsampled RGGB; downsample x2). Linear. G=(G1+G2)/2 if applicable."
+hdr['NPLANE']=(3,'RGB planes: 1=R, 2=G, 3=B')
+if date_obs: hdr['DATE-OBS']=(date_obs,'From EXIF DateTimeOriginal')
+hdr['ORIGFILE']=(orig,'Original raw filename')
+
+if exif_path and exif_path != "NONE" and os.path.exists(exif_path):
+    try:
+        meta_all = json.load(open(exif_path,'r'))
+        meta = meta_all[0] if isinstance(meta_all,list) and meta_all else meta_all
+        if 'ExposureTime' in meta: hdr['EXPTIME']=(float(meta['ExposureTime']),'Exposure time [s]')
+        if 'ISO' in meta: hdr['ISO']=(int(meta['ISO']),'ISO setting')
+        if 'FNumber' in meta: hdr['FNUMBER']=(float(meta['FNumber']),'F-number')
+        if 'FocalLength' in meta: hdr['FOCALLEN']=(float(meta['FocalLength']),'Focal length [mm]')
+        cam = (meta.get('Make','')+' '+meta.get('Model','')).strip()
+        if cam: hdr['INSTRUME']=(cam,'Camera model')
+    except Exception:
+        pass
+
+fits.PrimaryHDU(data=cube, header=hdr).writeto(fits_out, overwrite=True)
+PYCODE
+}
+
+# =========================
+# Adobe DNG Converter wrapper
+# =========================
+run_adc_for_one () {
+  local in_raw="$1" out_dir="$2"
+  local adc_in="$in_raw" adc_out="$out_dir"
+  mkdir -p "$out_dir"
+  if [ "$HAS_ADC" -eq 1 ] && command -v winepath >/dev/null 2>&1; then
+    adc_in="$(env WINEPREFIX="$ADC_WINEPREFIX" winepath -w "$in_raw" 2>/dev/null || printf "%s" "$in_raw")"
+    adc_out="$(env WINEPREFIX="$ADC_WINEPREFIX" winepath -w "$out_dir" 2>/dev/null || printf "%s" "$out_dir")"
+  fi
+  "${ADC_CMD[@]}" -mp -fl -d "$adc_out" "$adc_in"
+}
+
+# =========================
+# Main loop
+# =========================
+i=0
+cat "$FILES0" |
+while IFS= read -r -d '' RAW; do
+  i=$((i+1))
+  base="$(basename "$RAW")"
+  stem="${base%.*}"
+  out="$OUT_DIR/${stem}.fits"
+  ext_lc="$(printf '%s' "${base##*.}" | tr '[:upper:]' '[:lower:]')"
+
+  # Extract EXIF metadata (numeric with -n), and DATE-OBS from EXIF
+  DATEOBS=""
+  EXIF_JSON_PATH="NONE"
+  TMPDIR="${OUT_DIR}/.tmp_${stem}"
+  mkdir -p "$TMPDIR"
+
+  if [ "$HAS_EXIFTOOL" -eq 1 ]; then
+    # DATE-OBS with timezone if present
+    rawdt="$(exiftool -s -s -s -DateTimeOriginal -d '%Y-%m-%d %H:%M:%S%z' "$RAW" || true)"
+    if [ -z "$rawdt" ]; then
+      rawdt="$(exiftool -s -s -s -CreateDate -d '%Y-%m-%d %H:%M:%S%z' "$RAW" || true)"
+    fi
+    if [ -n "$rawdt" ]; then DATEOBS="${rawdt/ /T}"; fi
+
+    # Numeric JSON for robust parsing (no units, pure numbers)
+    exiftool -n -j -ExposureTime -ISO -FNumber -FocalLength -Make -Model "$RAW" > "$TMPDIR/exif.json" 2>/dev/null || true
+    if [ -s "$TMPDIR/exif.json" ]; then EXIF_JSON_PATH="$TMPDIR/exif.json"; fi
+  fi
+
+  qinfo "[INFO] ($i/$COUNT) → $base"
+
+  ok=0
+  case "$MODE" in
+    cfa)
+      if read_raw_cfa_py "$RAW" "$TMPDIR/cfa_raw" >/dev/null 2>&1; then
+        write_fits_cfa_py "$TMPDIR/cfa_raw.npz" "$out" "$DATEOBS" "$base" "$EXIF_JSON_PATH"; ok=1
+      fi;;
+    rgb)
+      if demosaic_linear_rgb_py "$RAW" "$TMPDIR/rgb.npy" >/dev/null 2>&1; then
+        write_fits_rgb_py "$TMPDIR/rgb.npy" "$out" "$DATEOBS" "$base" "$EXIF_JSON_PATH"; ok=1
+      fi;;
+    planes)
+      if read_raw_cfa_py "$RAW" "$TMPDIR/cfa_raw" >/dev/null 2>&1; then
+        cfa_to_planes_py "$TMPDIR/cfa_raw.npz" "$TMPDIR/planes" "$GREENS"
+        write_fits_planes_cube_py "$TMPDIR/planes.npz" "$out" "$DATEOBS" "$base" "$EXIF_JSON_PATH"; ok=1
+      fi;;
+  esac
+
+  if [ "$ok" -eq 1 ]; then
+    rm -rf "$TMPDIR"
+    continue
+  fi
+
+  if [ "$ext_lc" = "dng" ]; then
+    qwarn "       [ERROR] Could not read existing DNG: $base"
+    rm -rf "$TMPDIR"
+    continue
+  fi
+
+  if [ "$HAS_ADC" -ne 1 ]; then
+    qwarn "       [ERROR] Adobe DNG Converter not available for NEF fallback: $base"
+    rm -rf "$TMPDIR"
+    continue
+  fi
+
+  # Fallback: make DNG with Adobe DNG Converter
+  qinfo "       [FALLBACK] NEF unsupported; invoking Adobe DNG Converter..."
+  dng_dir="$(dirname "$RAW")/$ADC_OUT_SUBDIR_NAME"
+  run_adc_for_one "$RAW" "$dng_dir" || { qwarn "       [ERROR] ADC failed"; rm -rf "$TMPDIR"; continue; }
+
+  DNG="$dng_dir/$stem.dng"
+  [ ! -f "$DNG" ] && DNG="$(ls -1t "$dng_dir"/*.dng 2>/dev/null | head -n1 || true)"
+  if [ -z "${DNG:-}" ] || [ ! -f "$DNG" ]; then
+    qwarn "       [ERROR] No DNG produced for $base"; rm -rf "$TMPDIR"; continue
+  fi
+  qinfo "       [FALLBACK] Using generated DNG: $(basename "$DNG")"
+
+  ok=0
+  case "$MODE" in
+    cfa)
+      if read_raw_cfa_py "$DNG" "$TMPDIR/cfa_raw" >/dev/null 2>&1; then
+        write_fits_cfa_py "$TMPDIR/cfa_raw.npz" "$out" "$DATEOBS" "$base" "$EXIF_JSON_PATH"; ok=1
+      fi;;
+    rgb)
+      if demosaic_linear_rgb_py "$DNG" "$TMPDIR/rgb.npy" >/dev/null 2>&1; then
+        write_fits_rgb_py "$TMPDIR/rgb.npy" "$out" "$DATEOBS" "$base" "$EXIF_JSON_PATH"; ok=1
+      fi;;
+    planes)
+      if read_raw_cfa_py "$DNG" "$TMPDIR/cfa_raw" >/dev/null 2>&1; then
+        cfa_to_planes_py "$TMPDIR/cfa_raw.npz" "$TMPDIR/planes" "$GREENS"
+        write_fits_planes_cube_py "$TMPDIR/planes.npz" "$out" "$DATEOBS" "$base" "$EXIF_JSON_PATH"; ok=1
+      fi;;
+  esac
+
+  if [ "$ok" -eq 1 ]; then
+    if [ "${KEEP_DNG:-0}" -eq 0 ] && [ -n "${DNG:-}" ] && [ -f "$DNG" ]; then
+      rm -f -- "$DNG"
+    fi
+    rm -rf "$TMPDIR"
+  else
+    qwarn "       [ERROR] Could not read even the generated DNG for $base"
+    rm -rf "$TMPDIR"
+  fi
+done
+rm -f "$FILES0" 2>/dev/null || true
+
+qinfo "[DONE] FITS written to: $OUT_DIR"
+
+# --- end-of-run cleanup of script-created DNGs -------------------------------
+# By default we remove any .dng files created under _DNG_BY_SCRIPT folders
+# within the *input* root (first positional argument), unless --keep-dng was set.
+# Safety rails:
+#  - Only touches paths inside directories literally named _DNG_BY_SCRIPT
+#  - Only deletes files with .dng/.DNG extension
+#  - If the script exited early (non-zero), this block may not run; that's desirable.
+if [ "${KEEP_DNG:-0}" -eq 0 ]; then
+  _INPUT_ROOT="${1:-}"
+  if [ -n "$_INPUT_ROOT" ] && [ -d "$_INPUT_ROOT" ]; then
+        # Find each _DNG_BY_SCRIPT directory and delete only .dng files inside
+    while IFS= read -r -d '' _d; do
+      # List then delete; if find -delete is unavailable on platform, fallback to rm
+      if command -v find >/dev/null 2>&1; then
+        find "$_d" -maxdepth 1 -type f \( -iname '*.dng' \) -delete 2>/dev/null \
+        || { find "$_d" -maxdepth 1 -type f \( -iname '*.dng' \) -exec rm -f -- {} +; }
+      else
+        # Very unlikely on macOS, but keep a fallback
+        for _f in "$_d"/*.dng "$_d"/*.DNG; do
+          [ -f "$_f" ] && rm -f -- "$_f"
+        done
+      fi
+    done < <(find "$_INPUT_ROOT" -type d -name "_DNG_BY_SCRIPT" -print0 2>/dev/null)
+  fi
+fi
+# -----------------------------------------------------------------------------

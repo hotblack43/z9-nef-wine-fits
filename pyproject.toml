@@ -1,0 +1,18 @@
+[project]
+name = "z9-nef-wine-fits"
+version = "0.1.0"
+description = "Convert Nikon Z9 HE/HE* NEF files to linear FITS using Adobe DNG Converter under Wine when rawpy cannot read the NEF directly."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+  { name = "Project contributors" }
+]
+dependencies = [
+  "astropy",
+  "numpy",
+  "rawpy",
+]
+
+[tool.uv]
+package = false

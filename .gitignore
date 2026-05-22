@@ -1,0 +1,25 @@
+# Generated products
+FITS_LINEAR/
+_DNG_BY_SCRIPT/
+*.fits
+*.fit
+*.dng
+*.DNG
+
+# Logs and temporary files
+*.log
+.tmp_*/
+.nef2fits_env/
+.venv/
+__pycache__/
+*.py[cod]
+
+# Local Wine/Adobe installs. Do not commit the Windows application.
+.wine-adobe-dng/
+wineprefix/
+AdobeDNGConverter*.exe
+
+# OS/editor files
+.DS_Store
+.vscode/
+.idea/
