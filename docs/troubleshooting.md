@@ -29,19 +29,19 @@ find "$HOME/.local/share/z9-nef-wine-fits/wineprefix" -iname 'Adobe DNG Converte
 Quote wildcard patterns when passing one pattern:
 
 ```bash
-bin/z9-nef-to-fits '/data/session with spaces/orig/iss*.NEF'
+/path/to/z9-nef-wine-fits/bin/z9-nef-to-fits '/data/session with spaces/orig/iss*.NEF'
 ```
 
 Unquoted shell-expanded wildcards also work when the shell expands them to files:
 
 ```bash
-bin/z9-nef-to-fits orig/iss*.NEF
+/path/to/z9-nef-wine-fits/bin/z9-nef-to-fits orig/iss*.NEF
 ```
 
 ## Keeping DNGs Temporarily
 
 ```bash
-bin/z9-nef-to-fits-one '/data/orig/*.NEF' --keep-dng
+/path/to/z9-nef-wine-fits/bin/z9-nef-to-fits-one '/data/orig/*.NEF' --keep-dng
 ```
 
 DNGs are otherwise deleted after successful FITS creation.

@@ -181,6 +181,7 @@ esac
 mkdir -p "$OUT_DIR"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # ---- Adobe DNG Converter path/command ----
 # On Linux, install the Windows Adobe DNG Converter under Wine with
@@ -265,9 +266,9 @@ PYTHON_RUNNER=()
 
 if command -v uv >/dev/null 2>&1; then
   qinfo "[INFO] Using uv project environment for Python."
-  PYTHON_RUNNER=(uv run --project "$SCRIPT_DIR" python)
+  PYTHON_RUNNER=(uv run --project "$PROJECT_ROOT" python)
 else
-  VENV_DIR="$SCRIPT_DIR/.nef2fits_env"
+  VENV_DIR="$PROJECT_ROOT/.nef2fits_env"
   recreate_venv=0
   if [ ! -d "$VENV_DIR" ]; then
     recreate_venv=1

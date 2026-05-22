@@ -20,10 +20,11 @@ sudo apt-get update
 sudo apt-get install -y wine64 wine wine32:i386 xvfb curl exiftool python3 python3-venv
 ```
 
-Install Python dependencies with `uv`:
+Clone the repository and work from one directory above the checkout:
 
 ```bash
-uv sync
+git clone https://github.com/hotblack43/z9-nef-wine-fits.git
+uv sync --project z9-nef-wine-fits
 ```
 
 Or use your own Python environment and install the packages from `pyproject.toml`.
@@ -31,19 +32,27 @@ Or use your own Python environment and install the packages from `pyproject.toml
 Set up Adobe DNG Converter under Wine:
 
 ```bash
-bin/setup-adobe-dng-wine
+./z9-nef-wine-fits/bin/setup-adobe-dng-wine
 ```
 
-Convert files:
+The Adobe installer opens a normal Windows installer window under Wine the first time. Accept the license agreement, continue the installation, then on the final screen remove the check mark from "Launch Adobe DNG Converter" and click Finish. Normal conversions after this are command-line only.
+
+Convert files from one directory above the checkout:
 
 ```bash
-bin/z9-nef-to-fits '/path/with spaces/orig/iss*.NEF'
+./z9-nef-wine-fits/bin/z9-nef-to-fits '/path/with spaces/orig/iss*.NEF'
 ```
 
-From inside a directory containing an `orig/` folder, this is enough:
+From inside a directory containing an `orig/` folder, use the full path to the checked-out command:
 
 ```bash
 /path/to/z9-nef-wine-fits/bin/z9-nef-to-fits orig/iss*.NEF
+```
+
+If your shell is currently inside the repository root, the shorter `bin/...` form also works:
+
+```bash
+bin/z9-nef-to-fits examples/sample-data/iss074e0407380.NEF
 ```
 
 The output will be:
@@ -58,21 +67,21 @@ orig/FITS_LINEAR/z9-nef-to-fits.log
 Main command:
 
 ```bash
-bin/z9-nef-to-fits PATH_OR_WILDCARD [FILE ...]
+/path/to/z9-nef-wine-fits/bin/z9-nef-to-fits PATH_OR_WILDCARD [FILE ...]
 ```
 
 Examples:
 
 ```bash
-bin/z9-nef-to-fits examples/sample-data/iss074e0407380.NEF
-bin/z9-nef-to-fits '/data/session with spaces/orig/iss074e0407*.NEF'
-bin/z9-nef-to-fits /data/session/orig
+./z9-nef-wine-fits/bin/z9-nef-to-fits './z9-nef-wine-fits/examples/sample-data/iss074e0407380.NEF'
+./z9-nef-wine-fits/bin/z9-nef-to-fits '/data/session with spaces/orig/iss074e0407*.NEF'
+./z9-nef-wine-fits/bin/z9-nef-to-fits /data/session/orig
 ```
 
 Advanced one-file/batch command with options:
 
 ```bash
-bin/z9-nef-to-fits-one INPUT [OUTPUT_DIR] [INPUT ...] [--outdir DIR] [--mode cfa|planes|rgb] [--greens mean|both] [--keep-dng]
+/path/to/z9-nef-wine-fits/bin/z9-nef-to-fits-one INPUT [OUTPUT_DIR] [INPUT ...] [--outdir DIR] [--mode cfa|planes|rgb] [--greens mean|both] [--keep-dng]
 ```
 
 Modes:
@@ -96,7 +105,7 @@ Runtime environment overrides:
 ```bash
 ADOBE_DNG_WINEPREFIX=/path/to/wineprefix \
 ADOBE_DNG_EXE='/path/to/Adobe DNG Converter.exe' \
-bin/z9-nef-to-fits '/data/orig/*.NEF'
+/path/to/z9-nef-wine-fits/bin/z9-nef-to-fits '/data/orig/*.NEF'
 ```
 
 Older variable names are also accepted for compatibility: `ADC_WINEPREFIX`, `ADC_WIN_EXE`, and `ADC_WINE_BIN`.
@@ -110,7 +119,7 @@ A single trial NEF is included under `examples/sample-data/` for local smoke tes
 After setup:
 
 ```bash
-tests/smoke-test.sh
+./z9-nef-wine-fits/tests/smoke-test.sh
 ```
 
 The test converts `examples/sample-data/iss074e0407380.NEF` and checks that the FITS file exists and can be opened with Astropy.

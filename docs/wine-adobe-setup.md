@@ -15,7 +15,7 @@ sudo apt-get install -y wine64 wine wine32:i386 xvfb curl exiftool python3 pytho
 ## Install Adobe DNG Converter
 
 ```bash
-bin/setup-adobe-dng-wine
+./z9-nef-wine-fits/bin/setup-adobe-dng-wine
 ```
 
 The script downloads Adobe's Windows installer and runs it in this Wine prefix by default:
@@ -24,16 +24,16 @@ The script downloads Adobe's Windows installer and runs it in this Wine prefix b
 $HOME/.local/share/z9-nef-wine-fits/wineprefix
 ```
 
-The Adobe installer may show a GUI once. Finish that installer. Normal conversions after that are command-line driven.
+The Adobe installer shows a normal Windows installer window under Wine the first time. Accept the license agreement, continue the installation, then on the final screen remove the check mark from "Launch Adobe DNG Converter" and click Finish. Normal conversions after that are command-line driven.
 
 ## Non-Default Prefix
 
 ```bash
-ADOBE_DNG_WINEPREFIX=/some/prefix bin/setup-adobe-dng-wine
+ADOBE_DNG_WINEPREFIX=/some/prefix ./z9-nef-wine-fits/bin/setup-adobe-dng-wine
 ```
 
 Use the same prefix when converting if it is not the default:
 
 ```bash
-ADOBE_DNG_WINEPREFIX=/some/prefix bin/z9-nef-to-fits '/data/orig/*.NEF'
+ADOBE_DNG_WINEPREFIX=/some/prefix /path/to/z9-nef-wine-fits/bin/z9-nef-to-fits '/data/orig/*.NEF'
 ```
