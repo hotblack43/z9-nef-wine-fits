@@ -1,9 +1,17 @@
 # Sample Data
 
-`iss074e0407380.NEF` is included as a local trial image for smoke testing the converter. Before making this repository public, verify that this specific image can be redistributed publicly, or replace it with another NEF whose license is known.
+No redistributable Nikon HE/HE* sample NEF is stored in this repository.
 
-Run from the repository root:
+To run the smoke test, place your own local test file here as:
+
+```text
+examples/sample-data/iss074e0407380.NEF
+```
+
+or pass one explicitly:
 
 ```bash
-bin/z9-nef-to-fits examples/sample-data/iss074e0407380.NEF
+SAMPLE_NEF=/path/to/your/test.NEF tests/smoke-test.sh
 ```
+
+Generated outputs under `FITS_LINEAR/` are ignored by Git.

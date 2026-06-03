@@ -2,8 +2,23 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-SAMPLE="$REPO_ROOT/examples/sample-data/iss074e0407380.NEF"
-OUT="$REPO_ROOT/examples/sample-data/FITS_LINEAR/iss074e0407380.fits"
+DEFAULT_SAMPLE="$REPO_ROOT/examples/sample-data/iss074e0407380.NEF"
+SAMPLE="${SAMPLE_NEF:-$DEFAULT_SAMPLE}"
+
+if [ ! -s "$SAMPLE" ]; then
+  cat >&2 <<EOF
+No sample NEF found; skipping smoke test.
+
+Place a test file at:
+  $DEFAULT_SAMPLE
+
+or run with:
+  SAMPLE_NEF=/path/to/your/test.NEF $0
+EOF
+  exit 0
+fi
+
+OUT="$(dirname "$SAMPLE")/FITS_LINEAR/$(basename "${SAMPLE%.*}").fits"
 
 "$REPO_ROOT/bin/z9-nef-to-fits" "$SAMPLE"
 

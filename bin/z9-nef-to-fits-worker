@@ -67,7 +67,7 @@ qwarn() { [ "$QUIET" -eq 1 ] || echo "$@"; }
 #     --mode planes : per-channel planes by 2x2 averaging (downsample x2)
 #     --mode rgb    : linear demosaic (simple linear interpolation) -> FITS cube (3,H,W)
 #   Greens in 'planes':
-#     --greens mean or --greens both (default; G1/G2 separately)
+#     --greens mean (default; R, mean(G1,G2), B) or --greens both (R, G1, G2, B)
 #
 # * FITS headers (when exiftool is available):
 #     DATE-OBS   From EXIF DateTimeOriginal
@@ -83,6 +83,7 @@ qwarn() { [ "$QUIET" -eq 1 ] || echo "$@"; }
 # ----------------------------------------------------------------------
 
 usage() {
+  local status="${1:-1}"
   cat >&2 <<'USAGE'
 Usage:
   z9-nef-to-fits-worker INPUT_PATH [OUTPUT_DIR] [--mode cfa|rgb|planes] [--greens mean|both] [--keep-dng]
@@ -92,7 +93,7 @@ Defaults:
                directory input  -> INPUT_PATH/FITS_LINEAR
                file input       -> dirname(INPUT_PATH)/FITS_LINEAR
   --mode     = planes
-  --greens   = both   (only used with --mode planes)
+  --greens   = mean   (only used with --mode planes)
 
 Examples:
   z9-nef-to-fits-worker /path/to/RAW_DIR
@@ -103,8 +104,12 @@ Notes:
   - No input path is hardwired. You must provide at least one input path.
   - Accepted inputs: .nef, .dng, directories, or shell-expanded file lists.
 USAGE
-  exit 1
+  exit "$status"
 }
+
+case "${1:-}" in
+  --help|-h) usage 0;;
+esac
 
 # ---- Parse args (POSIX-friendly, bash 3.2 compatible) ----
 [ $# -lt 1 ] && {
@@ -146,7 +151,7 @@ esac
 
 OUT_DIR=""
 MODE="planes"
-GREENS="both"
+GREENS="mean"
 
 # If next arg doesn’t start with --, treat as OUT_DIR
 if [ $MULTI_FILES -eq 0 ] && [ $# -gt 0 ] && [ "${1#--}" = "$1" ]; then
@@ -164,7 +169,7 @@ while [ $# -gt 0 ]; do
     --greens)
       [ $# -lt 2 ] && usage
       GREENS="$2"; shift 2;;
-    --help|-h) usage;;
+    --help|-h) usage 0;;
     *) echo "Unknown option: $1" >&2; usage;;
   esac
 done
@@ -606,7 +611,7 @@ fits.HDUList(hdus).writeto(fits_out, overwrite=True)
 PYCODE
 }
 
-# PLANES->RGB CUBE writer (Primary HDU is a 3D cube)
+# PLANES cube writer (Primary HDU is a 3-D cube)
 write_fits_planes_cube_py () {
   # args: NPZ_PLANES FITS_OUT DATEOBS ORIG_NAME EXIF_JSON_PATH
   run_python - "$1" "$2" "$3" "$4" "$5" <<'PYCODE'
@@ -615,21 +620,21 @@ from astropy.io import fits
 npz_in, fits_out, date_obs, orig, exif_path = sys.argv[1:6]
 z = np.load(npz_in, allow_pickle=True)
 
-# Prefer R,G,B; otherwise build G from G1,G2 if present
 if all(k in z for k in ('R','G','B')):
     planes = [z['R'].astype(np.uint16), z['G'].astype(np.uint16), z['B'].astype(np.uint16)]
+    plane_comment = 'CFA planes: 1=R, 2=mean(G1,G2), 3=B'
 elif all(k in z for k in ('R','G1','G2','B')):
-    G = ((z['G1'].astype(np.uint32) + z['G2'].astype(np.uint32) + 1)//2).astype(np.uint16)
-    planes = [z['R'].astype(np.uint16), G, z['B'].astype(np.uint16)]
+    planes = [z['R'].astype(np.uint16), z['G1'].astype(np.uint16), z['G2'].astype(np.uint16), z['B'].astype(np.uint16)]
+    plane_comment = 'CFA planes: 1=R, 2=G1, 3=G2, 4=B'
 else:
     raise SystemExit(f"Unexpected planes in NPZ: {list(z.keys())}")
 
-cube = np.stack(planes, axis=0)  # (3,H,W)
+cube = np.stack(planes, axis=0)
 
 hdr = fits.Header()
 hdr['BITPIX']=16; hdr['BSCALE']=1; hdr['BZERO']=32768
-hdr['COMMENT']="Per-channel planes from CFA (subsampled RGGB; downsample x2). Linear. G=(G1+G2)/2 if applicable."
-hdr['NPLANE']=(3,'RGB planes: 1=R, 2=G, 3=B')
+hdr['COMMENT']="Per-channel planes from CFA (subsampled RGGB; downsample x2). Linear."
+hdr['NPLANE']=(len(planes), plane_comment)
 if date_obs: hdr['DATE-OBS']=(date_obs,'From EXIF DateTimeOriginal')
 hdr['ORIGFILE']=(orig,'Original raw filename')
 

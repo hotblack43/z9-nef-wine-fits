@@ -2,6 +2,7 @@
 set -euo pipefail
 
 usage() {
+  local status="${1:-1}"
   cat >&2 <<'USAGE'
 Usage:
   z9-nef-to-fits-one INPUT [OUTPUT_DIR] [INPUT ...] [--outdir DIR] [--mode cfa|planes|rgb] [--greens mean|both] [--keep-dng]
@@ -13,7 +14,7 @@ Purpose:
 
 Defaults:
   --mode planes
-  --greens both
+  --greens mean
   --outdir dirname(first input)/FITS_LINEAR
 
 Examples:
@@ -27,7 +28,7 @@ Notes:
   - Do not use `D5NEF_to_linearFITS.sh` for Nikon Z9 files.
   - Requires Adobe DNG Converter. On Linux, run bin/setup-adobe-dng-wine first.
 USAGE
-  exit 1
+  exit "$status"
 }
 
 [ $# -ge 1 ] || usage
@@ -41,7 +42,7 @@ CONVERTER="$SCRIPT_DIR/z9-nef-to-fits-worker"
 }
 
 MODE="planes"
-GREENS="both"
+GREENS="mean"
 OUTDIR=""
 KEEP_DNG=0
 POSITIONALS=()
@@ -61,7 +62,7 @@ while [ $# -gt 0 ]; do
     --keep-dng)
       KEEP_DNG=1; shift ;;
     --help|-h)
-      usage ;;
+      usage 0 ;;
     --*)
       echo "[ERROR] Unknown option: $1" >&2
       usage ;;

@@ -2,6 +2,7 @@
 set -euo pipefail
 
 usage() {
+  local status="${1:-1}"
   cat >&2 <<'USAGE'
 Usage:
   z9-nef-to-fits PATH_OR_WILDCARD [FILE ...]
@@ -14,8 +15,12 @@ Examples:
 Writes FITS to: input_directory/FITS_LINEAR
 Intermediate DNGs are removed by default. Details go to z9-nef-to-fits.log in the output directory.
 USAGE
-  exit 1
+  exit "$status"
 }
+
+case "${1:-}" in
+  --help|-h) usage 0;;
+esac
 
 [ $# -ge 1 ] || usage
 
