@@ -453,55 +453,6 @@ else:
 PYCODE
 }
 
-old_bad_cfa_to_planes_py () {
-  # args: NPZ_IN OUT_NPZ GREENS
-  run_python - "$1" "$2" "$3" <<'PYCODE'
-import sys, numpy as np
-from pathlib import Path
-
-npz_in  = Path(sys.argv[1])
-npz_out = Path(sys.argv[2])
-greens_mode = sys.argv[3]  # "mean" or "both"
-
-z = np.load(str(npz_in), allow_pickle=True)
-arr = z['data'].astype(np.uint16)
-
-def block_mean(x):
-    h = (x.shape[0]//2)*2
-    w = (x.shape[1]//2)*2
-    x = x[:h,:w].reshape(h//2,2,w//2,2).mean(axis=(1,3))
-    return x.astype(np.uint16)
-
-R = np.zeros_like(arr, dtype=np.uint16)
-G = np.zeros_like(arr, dtype=np.uint16)
-B = np.zeros_like(arr, dtype=np.uint16)
-R[0::2,0::2] = arr[0::2,0::2]
-B[1::2,1::2] = arr[1::2,1::2]
-G[0::2,1::2] = arr[0::2,1::2]
-G[1::2,0::2] = arr[1::2,0::2]
-
-R_plane = block_mean(R)
-B_plane = block_mean(B)
-
-if greens_mode == "both":
-    G1 = np.zeros_like(arr, dtype=np.uint16)
-    G2 = np.zeros_like(arr, dtype=np.uint16)
-    G1[0::2,1::2] = arr[0::2,1::2]
-    G2[1::2,0::2] = arr[1::2,0::2]
-    def bmean_off(x,r0,c0):
-        h = (x.shape[0]-r0)//2*2
-        w = (x.shape[1]-c0)//2*2
-        x = x[r0:r0+h, c0:c0+w]
-        return x.reshape(x.shape[0]//2,2,x.shape[1]//2,2).mean(axis=(1,3)).astype(np.uint16)
-    G1_plane = bmean_off(G1,0,1)
-    G2_plane = bmean_off(G2,1,0)
-    np.savez(str(npz_out), R=R_plane, G1=G1_plane, G2=G2_plane, B=B_plane)
-else:
-    G_plane = block_mean(G)
-    np.savez(str(npz_out), R=R_plane, G=G_plane, B=B_plane)
-PYCODE
-}
-
 # =========================
 # FITS writers (read EXIF JSON path for metadata)
 # =========================
@@ -570,44 +521,6 @@ if exif_path and exif_path != "NONE" and os.path.exists(exif_path):
         pass
 
 fits.PrimaryHDU(data=cube, header=hdr).writeto(fits_out, overwrite=True)
-PYCODE
-}
-
-# PLANES writer (multi-extension FITS)
-write_fits_planes_cube_py () {
-  # args: NPZ_PLANES FITS_OUT DATEOBS ORIG_NAME EXIF_JSON_PATH
-  run_python - "$1" "$2" "$3" "$4" "$5" <<'PYCODE'
-import sys, os, json, numpy as np
-from astropy.io import fits
-npz_in, fits_out, date_obs, orig, exif_path = sys.argv[1:6]
-z = np.load(npz_in)
-keys = list(z.keys())
-order = ['R','G','G1','G2','B']
-ordered = [k for k in order if k in keys]
-hdus=[]
-for i,k in enumerate(ordered):
-    data = z[k].astype(np.uint16)
-    if i==0:
-        hdr = fits.Header(); hdr['BITPIX']=16; hdr['BSCALE']=1; hdr['BZERO']=32768
-        hdr['COMMENT']="Per-channel planes from CFA (2x2 avg, downsample x2). Linear."
-        if date_obs: hdr['DATE-OBS']=(date_obs,'From EXIF DateTimeOriginal')
-        hdr['ORIGFILE']=(orig,'Original raw filename')
-        if exif_path and exif_path != "NONE" and os.path.exists(exif_path):
-            try:
-                meta_all = json.load(open(exif_path,'r'))
-                meta = meta_all[0] if isinstance(meta_all,list) and meta_all else meta_all
-                if 'ExposureTime' in meta: hdr['EXPTIME']=(float(meta['ExposureTime']),'Exposure time [s]')
-                if 'ISO' in meta: hdr['ISO']=(int(meta['ISO']),'ISO setting')
-                if 'FNumber' in meta: hdr['FNUMBER']=(float(meta['FNumber']),'F-number')
-                if 'FocalLength' in meta: hdr['FOCALLEN']=(float(meta['FocalLength']),'Focal length [mm]')
-                cam = (meta.get('Make','')+' '+meta.get('Model','')).strip()
-                if cam: hdr['INSTRUME']=(cam,'Camera model')
-            except Exception:
-                pass
-        hdus.append(fits.PrimaryHDU(data=data, header=hdr))
-    else:
-        hdus.append(fits.ImageHDU(data=data, name=k))
-fits.HDUList(hdus).writeto(fits_out, overwrite=True)
 PYCODE
 }
 

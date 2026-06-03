@@ -197,7 +197,7 @@ Older variable names are also accepted for compatibility: `ADC_WINEPREFIX`,
 
 ## Sample Data
 
-No redistributable Nikon HE/HE* sample NEF is guaranteed to be included.
+No Nikon HE/HE* sample NEF is included in the public repository.
 
 To run the smoke test, place a test NEF at:
 
@@ -205,7 +205,7 @@ To run the smoke test, place a test NEF at:
 examples/sample-data/iss074e0407380.NEF
 ```
 
-or edit `tests/smoke-test.sh` to point at your own local NEF.
+or run the smoke test with `SAMPLE_NEF=/path/to/your/test.NEF`.
 
 ## Smoke Test
 
