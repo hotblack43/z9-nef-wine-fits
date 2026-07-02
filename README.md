@@ -13,6 +13,17 @@ FITS, and removes the intermediate DNG by default.
 The normal user-facing output is intentionally quiet. Full details go to a
 log file in the output directory.
 
+## TL;DR
+
+```bash
+./bin/setup-adobe-dng-wine
+./bin/z9-nef-to-fits --mode planes --greens mean '/path/with spaces/orig/*.NEF'
+```
+
+By default this writes linear FITS files to `FITS_LINEAR/` next to the input
+files and removes intermediate DNG files. Use `--outdir DIR` to choose another
+output directory, and `--keep-dng` only when debugging.
+
 ## What This Is / Is Not
 
 This is not an open-source decoder for Nikon HE/HE* compression.
@@ -149,7 +160,7 @@ the output will be:
 Main command:
 
 ```bash
-/path/to/z9-nef-wine-fits/bin/z9-nef-to-fits PATH_OR_WILDCARD [FILE ...]
+/path/to/z9-nef-wine-fits/bin/z9-nef-to-fits [OPTIONS] PATH_OR_WILDCARD [FILE ...]
 ```
 
 Examples:
@@ -217,6 +228,21 @@ After setup, if sample data are available:
 
 The test converts `examples/sample-data/iss074e0407380.NEF` and checks that
 the FITS file exists and can be opened with Astropy.
+
+## Tested / Not Yet Tested
+
+Tested in CI without sample data:
+
+- `bin/z9-nef-to-fits --help` exits successfully.
+- Invalid `--mode` values fail before conversion.
+- Nonexistent input paths fail without requiring Wine or Adobe DNG Converter.
+- `tests/smoke-test.sh` skips cleanly when no sample NEF is present.
+
+Not yet tested in public CI:
+
+- Real Nikon Z9/Z8 HE or HE* NEF conversion.
+- Adobe DNG Converter under Wine on GitHub-hosted runners.
+- Photometric linearity for a specific camera body, firmware, and exposure set.
 
 ## Notes
 

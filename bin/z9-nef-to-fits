@@ -5,59 +5,102 @@ usage() {
   local status="${1:-1}"
   cat >&2 <<'USAGE'
 Usage:
-  z9-nef-to-fits PATH_OR_WILDCARD [FILE ...]
+  z9-nef-to-fits [OPTIONS] PATH_OR_WILDCARD [FILE ...]
+
+Options:
+  --outdir DIR              Write FITS and log to DIR
+  --mode cfa|planes|rgb     Output mode (default: planes)
+  --greens mean|both        Green handling for --mode planes (default: mean)
+  --keep-dng                Keep intermediate DNG files
 
 Examples:
   z9-nef-to-fits '/path/with spaces/orig'
   z9-nef-to-fits '/path/with spaces/orig/iss074e0407*.NEF'
   z9-nef-to-fits orig/iss*.NEF
+  z9-nef-to-fits --outdir '/tmp/fits out' --mode planes --greens both '/path/with spaces/orig/*.NEF'
 
-Writes FITS to: input_directory/FITS_LINEAR
+Default output directory: input_directory/FITS_LINEAR
 Intermediate DNGs are removed by default. Details go to z9-nef-to-fits.log in the output directory.
 USAGE
   exit "$status"
 }
 
-case "${1:-}" in
-  --help|-h) usage 0;;
-esac
-
-[ $# -ge 1 ] || usage
-
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONVERTER="$SCRIPT_DIR/z9-nef-to-fits-one"
 [ -x "$CONVERTER" ] || { echo "[ERROR] Missing converter: $CONVERTER" >&2; exit 1; }
 
+MODE="planes"
+GREENS="mean"
+OUTDIR=""
+KEEP_DNG=0
+INPUT_ARGS=()
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --outdir)
+      [ $# -lt 2 ] && usage
+      OUTDIR="$2"; shift 2 ;;
+    --mode)
+      [ $# -lt 2 ] && usage
+      MODE="$2"; shift 2 ;;
+    --greens)
+      [ $# -lt 2 ] && usage
+      GREENS="$2"; shift 2 ;;
+    --keep-dng)
+      KEEP_DNG=1; shift ;;
+    --help|-h)
+      usage 0 ;;
+    --*)
+      echo "[ERROR] Unknown option: $1" >&2
+      usage ;;
+    *)
+      INPUT_ARGS+=("$1"); shift ;;
+  esac
+done
+
+[ ${#INPUT_ARGS[@]} -ge 1 ] || usage
+
+case "$MODE" in
+  cfa|planes|rgb) ;;
+  *) echo "[ERROR] --mode must be cfa|planes|rgb" >&2; exit 1 ;;
+esac
+case "$GREENS" in
+  mean|both) ;;
+  *) echo "[ERROR] --greens must be mean|both" >&2; exit 1 ;;
+esac
+
 collect_files() {
   local arg="$1"
   if [ -d "$arg" ]; then
-    find "$arg" -maxdepth 1 -type f -iname '*.nef' -print0
+    find "$arg" -maxdepth 1 -type f \( -iname '*.nef' -o -iname '*.dng' \) -print0
+  elif [ -f "$arg" ]; then
+    case "${arg##*.}" in
+      NEF|nef|DNG|dng) printf '%s\0' "$arg" ;;
+    esac
   else
-    # Intentional wildcard expansion for the single PATH_OR_WILDCARD argument.
-    local matches=( $arg )
-    if [ ${#matches[@]} -eq 0 ]; then
-      return 0
-    fi
-    printf '%s\0' "${matches[@]}" | while IFS= read -r -d '' f; do
-      [ -f "$f" ] || continue
-      case "${f##*.}" in
-        NEF|nef|DNG|dng) printf '%s\0' "$f" ;;
-      esac
-    done
+    python3 - "$arg" <<'PYGLOB'
+import glob
+import os
+import sys
+
+for path in glob.glob(sys.argv[1]):
+    if os.path.isfile(path) and path.lower().endswith((".nef", ".dng")):
+        sys.stdout.buffer.write(path.encode() + b"\0")
+PYGLOB
   fi
 }
 
 TMP_LIST="$(mktemp -t z9simple.XXXXXX)"
 trap 'rm -f "$TMP_LIST"' EXIT
-for arg in "$@"; do
+for arg in "${INPUT_ARGS[@]}"; do
   collect_files "$arg" >> "$TMP_LIST"
 done
 
-COUNT="$(python3 - "$TMP_LIST" <<'PY'
+COUNT="$(python3 - "$TMP_LIST" <<'PYCOUNT'
 import sys
 with open(sys.argv[1], 'rb') as f:
     print(f.read().count(b'\0'))
-PY
+PYCOUNT
 )"
 
 if [ "$COUNT" -eq 0 ]; then
@@ -65,15 +108,17 @@ if [ "$COUNT" -eq 0 ]; then
   exit 1
 fi
 
-FIRST="$(python3 - "$TMP_LIST" <<'PY'
+FIRST="$(python3 - "$TMP_LIST" <<'PYFIRST'
 import sys
 with open(sys.argv[1], 'rb') as f:
     first = f.read().split(b'\0', 1)[0]
 print(first.decode())
-PY
+PYFIRST
 )"
 
-OUTDIR="$(dirname "$FIRST")/FITS_LINEAR"
+if [ -z "$OUTDIR" ]; then
+  OUTDIR="$(dirname "$FIRST")/FITS_LINEAR"
+fi
 mkdir -p "$OUTDIR"
 
 LOG="$OUTDIR/z9-nef-to-fits.log"
@@ -84,7 +129,11 @@ idx=0
 while IFS= read -r -d '' raw; do
   idx=$((idx + 1))
   printf '[%s/%s] %s ... ' "$idx" "$COUNT" "$(basename "$raw")"
-  if "$CONVERTER" "$raw" --outdir "$OUTDIR" >>"$LOG" 2>&1; then
+  CMD=( "$CONVERTER" "$raw" --outdir "$OUTDIR" --mode "$MODE" --greens "$GREENS" )
+  if [ "$KEEP_DNG" -eq 1 ]; then
+    CMD+=( --keep-dng )
+  fi
+  if "${CMD[@]}" >>"$LOG" 2>&1; then
     echo "ok"
   else
     echo "failed (see $LOG)"
